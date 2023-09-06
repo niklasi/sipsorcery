@@ -1,8 +1,0 @@
-{
-  "profiles": {
-    "webrtccmdline": {
-      "commandName": "Project",
-      "commandLineArgs": "--ws --stun=stun:stun.sipsorcery.com --relayonly"
-    }
-  }
-}
