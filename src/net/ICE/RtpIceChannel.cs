@@ -751,6 +751,12 @@ namespace SIPSorcery.Net
                 logger.LogDebug($"ICE RTP channel sending TURN permissions request {NominatedEntry.TurnPermissionsRequestSent} " +
                                 $"to server {NominatedEntry.LocalCandidate.IceServer._uri} for peer {NominatedEntry.RemoteCandidate.DestinationEndPoint} " +
                                 $"(TxID: {NominatedEntry.RequestTransactionID}).");
+
+                if (string.IsNullOrEmpty(NominatedEntry.RequestTransactionID))
+                {
+                    logger.LogWarning("Could not create turn permission request because 'RequestTransactionID' is missing");
+                    return;
+                }
                 SendTurnCreatePermissionsRequest(NominatedEntry.RequestTransactionID, NominatedEntry.LocalCandidate.IceServer, NominatedEntry.RemoteCandidate.DestinationEndPoint);
             }
         }
@@ -1367,7 +1373,7 @@ namespace SIPSorcery.Net
                 {
                     // Send Create Permissions request to TURN server for remote candidate.
                     candidatePair.TurnPermissionsRequestSent++;
-                    logger.LogDebug($"ICE RTP channel sending TURN permissions request {candidatePair.TurnPermissionsRequestSent} to server {candidatePair.LocalCandidate.IceServer._uri} for peer {candidatePair.RemoteCandidate.DestinationEndPoint} (TxID: {candidatePair.RequestTransactionID}).");
+                    logger.LogDebug($"SendConnectivityCheck: ICE RTP channel sending TURN permissions request {candidatePair.TurnPermissionsRequestSent} to server {candidatePair.LocalCandidate.IceServer._uri} for peer {candidatePair.RemoteCandidate.DestinationEndPoint} (TxID: {candidatePair.RequestTransactionID}).");
                     SendTurnCreatePermissionsRequest(candidatePair.RequestTransactionID, candidatePair.LocalCandidate.IceServer, candidatePair.RemoteCandidate.DestinationEndPoint);
                 }
             }
@@ -1569,7 +1575,7 @@ namespace SIPSorcery.Net
                                 // This is the response to a connectivity check that had the "UseCandidate" attribute set.
                                 SetNominatedEntry(matchingChecklistEntry);
                             }
-                            else if(IsController)
+                            else if (IsController)
                             {
                                 ProcessNominateLogicAsController(matchingChecklistEntry);
                             }
@@ -1984,6 +1990,7 @@ namespace SIPSorcery.Net
         /// <returns>The result from the socket send (not the response code from the TURN server).</returns>
         private SocketError SendTurnCreatePermissionsRequest(string transactionID, IceServer iceServer, IPEndPoint peerEndPoint)
         {
+
             STUNMessage permissionsRequest = new STUNMessage(STUNMessageTypesEnum.CreatePermission);
             permissionsRequest.Header.TransactionId = Encoding.ASCII.GetBytes(transactionID);
             permissionsRequest.Attributes.Add(new STUNXORAddressAttribute(STUNAttributeTypesEnum.XORPeerAddress, peerEndPoint.Port, peerEndPoint.Address));
