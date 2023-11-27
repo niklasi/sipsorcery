@@ -15,6 +15,7 @@
 //-----------------------------------------------------------------------------
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using Microsoft.Extensions.Logging;
@@ -25,6 +26,29 @@ namespace SIPSorcery.net.RTP
 {
     public class MediaStream
     {
+        protected internal class PendingPackages
+        {
+            public RTPHeader hdr;
+            public int localPort;
+            public IPEndPoint remoteEndPoint;
+            public byte[] buffer;
+            public VideoStream videoStream;
+
+            public PendingPackages() { }
+
+            public PendingPackages(RTPHeader hdr, int localPort, IPEndPoint remoteEndPoint, byte[] buffer, VideoStream videoStream)
+            {
+                this.hdr = hdr;
+                this.localPort = localPort;
+                this.remoteEndPoint = remoteEndPoint;
+                this.buffer = buffer;
+                this.videoStream = videoStream;
+            }
+        }
+
+        protected object _pendingPackagesLock = new object();
+        protected List<PendingPackages> _pendingPackagesBuffer = new List<PendingPackages>();
+
         private static ILogger logger = Log.Logger;
 
         private uint m_lastRtpTimestamp;
@@ -39,6 +63,8 @@ namespace SIPSorcery.net.RTP
         MediaStreamTrack m_localTrack;
 
         protected RTPChannel rtpChannel = null;
+
+        protected bool _isClosed = false;
 
         public int Index = -1;
 
@@ -74,6 +100,8 @@ namespace SIPSorcery.net.RTP
         /// </summary>
         public event Action<int, IPEndPoint, SDPMediaTypesEnum, RTCPCompoundPacket> OnReceiveReportByIndex;
 
+        public event Action<bool> OnIsClosedStateChanged;
+
         #endregion EVENTS
 
         #region PROPERTIES
@@ -84,7 +112,26 @@ namespace SIPSorcery.net.RTP
         /// Indicates whether the session has been closed. Once a session is closed it cannot
         /// be restarted.
         /// </summary>
-        public bool IsClosed { get; set; } = false;
+        public bool IsClosed
+        {
+            get
+            {
+                return _isClosed;
+            }
+            set
+            {
+                if (_isClosed == value)
+                {
+                    return;
+                }
+                _isClosed = value;
+
+                //Clear previous buffer
+                ClearPendingPackages();
+
+                OnIsClosedStateChanged?.Invoke(_isClosed);
+            }
+        }
 
         /// <summary>
         /// In order to detect RTP events from the remote party this property needs to 
@@ -184,7 +231,7 @@ namespace SIPSorcery.net.RTP
 
         #region SECURITY CONTEXT
 
-        public void SetSecurityContext( ProtectRtpPacket protectRtp, ProtectRtpPacket unprotectRtp, ProtectRtpPacket protectRtcp, ProtectRtpPacket unprotectRtcp)
+        public void SetSecurityContext(ProtectRtpPacket protectRtp, ProtectRtpPacket unprotectRtp, ProtectRtpPacket protectRtcp, ProtectRtpPacket unprotectRtcp)
         {
             if (SecureContext != null)
             {
@@ -192,6 +239,8 @@ namespace SIPSorcery.net.RTP
             }
 
             SecureContext = new SecureContext(protectRtp, unprotectRtp, protectRtcp, unprotectRtcp);
+
+            DispatchPendingPackages();
         }
 
         public SecureContext GetSecurityContext()
@@ -244,7 +293,7 @@ namespace SIPSorcery.net.RTP
 
         public SrtpHandler GetOrCreateSrtpHandler()
         {
-            if(SrtpHandler == null)
+            if (SrtpHandler == null)
             {
                 SrtpHandler = new SrtpHandler();
             }
@@ -276,7 +325,7 @@ namespace SIPSorcery.net.RTP
 
         protected Boolean CheckIfCanSendRtpRaw()
         {
-            if(IsClosed)
+            if (IsClosed)
             {
                 logger.LogWarning($"SendRtpRaw was called for an {MediaType} packet on an closed RTP session.");
                 return false;
@@ -288,7 +337,7 @@ namespace SIPSorcery.net.RTP
                 return false;
             }
 
-            if ( (LocalTrack.StreamStatus == MediaStreamStatusEnum.RecvOnly) || (LocalTrack.StreamStatus == MediaStreamStatusEnum.Inactive) )
+            if ((LocalTrack.StreamStatus == MediaStreamStatusEnum.RecvOnly) || (LocalTrack.StreamStatus == MediaStreamStatusEnum.Inactive))
             {
                 logger.LogWarning($"SendRtpRaw was called for an {MediaType} packet on an RTP session with a Stream Status set to {LocalTrack.StreamStatus}");
                 return false;
@@ -303,7 +352,7 @@ namespace SIPSorcery.net.RTP
             return true;
         }
 
-        protected void SendRtpRaw(byte[] data, uint timestamp, int markerBit, int payloadType, Boolean checkDone)
+        protected void SendRtpRaw(byte[] data, uint timestamp, int markerBit, int payloadType, Boolean checkDone, ushort? seqNum = null)
         {
             if (checkDone || CheckIfCanSendRtpRaw())
             {
@@ -312,7 +361,7 @@ namespace SIPSorcery.net.RTP
 
                 RTPPacket rtpPacket = new RTPPacket(data.Length + srtpProtectionLength);
                 rtpPacket.Header.SyncSource = LocalTrack.Ssrc;
-                rtpPacket.Header.SequenceNumber = LocalTrack.GetNextSeqNum();
+                rtpPacket.Header.SequenceNumber = seqNum ?? LocalTrack.GetNextSeqNum();
                 rtpPacket.Header.Timestamp = timestamp;
                 rtpPacket.Header.MarkerBit = markerBit;
                 rtpPacket.Header.PayloadType = payloadType;
@@ -342,6 +391,20 @@ namespace SIPSorcery.net.RTP
 
                 RtcpSession?.RecordRtpPacketSend(rtpPacket);
             }
+        }
+
+        /// <summary>
+        /// Allows additional control for sending raw RTP payloads. No framing or other processing is carried out.
+        /// </summary>
+        /// <param name="mediaType">The media type of the RTP packet being sent. Must be audio or video.</param>
+        /// <param name="payload">The RTP packet payload.</param>
+        /// <param name="timestamp">The timestamp to set on the RTP header.</param>
+        /// <param name="markerBit">The value to set on the RTP header marker bit, should be 0 or 1.</param>
+        /// <param name="payloadTypeID">The payload ID to set in the RTP header.</param>
+        /// <param name="seqNum"> The RTP sequence number </param>
+        public void SendRtpRaw(byte[] data, uint timestamp, int markerBit, int payloadType, ushort seqNum)
+        {
+            SendRtpRaw(data, timestamp, markerBit, payloadType, false, seqNum);
         }
 
         /// <summary>
@@ -469,6 +532,9 @@ namespace SIPSorcery.net.RTP
             {
                 if (!EnsureBufferUnprotected(buffer, hdr, out rtpPacket))
                 {
+                    // Cache pending packages to use it later to prevent missing frames
+                    // when DTLS was not completed yet as a Server bt already completed as a client
+                    AddPendingPackage(hdr, localPort, remoteEndPoint, buffer, videoStream);
                     return;
                 }
 
@@ -515,10 +581,11 @@ namespace SIPSorcery.net.RTP
                 return;
             }
 
-            var format = RemoteTrack?.GetFormatForPayloadID(hdr.PayloadType);
-            if ( (rtpPacket != null) && (format != null) )
+            // When receiving an Payload from other peer, it will be related to our LocalDescription,
+            // not to RemoteDescription (as proved by Azure WebRTC Implementation)
+            var format = LocalTrack?.GetFormatForPayloadID(hdr.PayloadType);
+            if ((rtpPacket != null) && (format != null))
             {
-
                 if (UseBuffer())
                 {
                     var reorderBuffer = GetBuffer();
@@ -569,6 +636,68 @@ namespace SIPSorcery.net.RTP
         }
 
         #endregion TO RAISE EVENTS FROM INHERITED CLASS
+
+        #region PENDING PACKAGES LOGIC
+
+        // Submit all previous cached packages to self
+        protected virtual void DispatchPendingPackages()
+        {
+            PendingPackages[] pendingPackagesArray = null;
+
+            var isContextValid = SecureContext != null && !IsClosed;
+
+            lock (_pendingPackagesLock)
+            {
+                if (isContextValid)
+                {
+                    pendingPackagesArray = _pendingPackagesBuffer.ToArray();
+                }
+                _pendingPackagesBuffer.Clear();
+            }
+            if (isContextValid)
+            {
+                foreach (var pendingPackage in pendingPackagesArray)
+                {
+                    if (pendingPackage != null)
+                    {
+                        OnReceiveRTPPacket(pendingPackage.hdr, pendingPackage.localPort, pendingPackage.remoteEndPoint, pendingPackage.buffer, pendingPackage.videoStream);
+                    }
+                }
+            }
+        }
+
+        // Clear previous buffer
+        protected virtual void ClearPendingPackages()
+        {
+            lock (_pendingPackagesLock)
+            {
+                _pendingPackagesBuffer.Clear();
+            }
+        }
+
+        // Cache pending packages to use it later to prevent missing frames
+        // when DTLS was not completed yet as a Server but already completed as a client
+        protected virtual bool AddPendingPackage(RTPHeader hdr, int localPort, IPEndPoint remoteEndPoint, byte[] buffer, VideoStream videoStream = null)
+        {
+            const int MAX_PENDING_PACKAGES_BUFFER_SIZE = 32;
+
+            if (SecureContext == null && !IsClosed)
+            {
+                lock (_pendingPackagesLock)
+                {
+                    //ensure buffer max size
+                    while (_pendingPackagesBuffer.Count > 0 && _pendingPackagesBuffer.Count >= MAX_PENDING_PACKAGES_BUFFER_SIZE)
+                    {
+                        _pendingPackagesBuffer.RemoveAt(0);
+                    }
+                    _pendingPackagesBuffer.Add(new PendingPackages(hdr, localPort, remoteEndPoint, buffer, videoStream));
+                }
+                return true;
+            }
+            return false;
+        }
+
+        #endregion
 
         protected void LogIfWrongSeqNumber(string trackType, RTPHeader header, MediaStreamTrack track)
         {
@@ -686,12 +815,12 @@ namespace SIPSorcery.net.RTP
                 if (MediaType == SDPMediaTypesEnum.audio)
                 {
 
-                    format = SDPAudioVideoMediaFormat.GetCompatibleFormats(LocalTrack.Capabilities, RemoteTrack.Capabilities)
+                    format = SDPAudioVideoMediaFormat.GetCompatibleFormats(RemoteTrack.Capabilities, LocalTrack.Capabilities)
                         .Where(x => x.ID != RemoteRtpEventPayloadID).FirstOrDefault();
                 }
                 else
                 {
-                    format = SDPAudioVideoMediaFormat.GetCompatibleFormats(LocalTrack.Capabilities, RemoteTrack.Capabilities).First();
+                    format = SDPAudioVideoMediaFormat.GetCompatibleFormats(RemoteTrack.Capabilities, LocalTrack.Capabilities).First();
                 }
 
                 if (format.IsEmpty())
@@ -732,5 +861,4 @@ namespace SIPSorcery.net.RTP
             this.Index = index;
         }
     }
-
 }

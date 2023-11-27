@@ -39,21 +39,54 @@ namespace SIPSorcery.Net
     /// Mono Socket source:
     /// https://github.com/mono/mono/blob/master/mcs/class/System/System.Net.Sockets/Socket.cs
     /// </remarks>
-    public sealed class UdpReceiver
+    public class UdpReceiver
     {
         /// <summary>
         /// MTU is 1452 bytes so this should be heaps.
         /// TODO: What about fragmented UDP packets that are put back together by the OS?
         /// </summary>
-        private const int RECEIVE_BUFFER_SIZE = 2048;
+        protected const int RECEIVE_BUFFER_SIZE = 2048;
 
-        private static ILogger logger = Log.Logger;
+        protected static ILogger logger = Log.Logger;
 
-        private readonly Socket m_udpSocket;
-        private byte[] m_recvBuffer;
-        private bool m_isClosed;
-        private IPEndPoint m_localEndPoint;
-        private AddressFamily m_addressFamily;
+        protected readonly Socket m_socket;
+        protected byte[] m_recvBuffer;
+        protected bool m_isClosed;
+        protected bool m_isRunningReceive;
+        protected IPEndPoint m_localEndPoint;
+        protected AddressFamily m_addressFamily;
+
+        public virtual bool IsClosed
+        {
+            get
+            {
+                return m_isClosed;
+            }
+            protected set
+            {
+                if (m_isClosed == value)
+                {
+                    return;
+                }
+                m_isClosed = value;
+            }
+        }
+
+        public virtual bool IsRunningReceive
+        {
+            get
+            {
+                return m_isRunningReceive;
+            }
+            protected set
+            {
+                if (m_isRunningReceive == value)
+                {
+                    return;
+                }
+                m_isRunningReceive = value;
+            }
+        }
 
         /// <summary>
         /// Fires when a new packet has been received on the UDP socket.
@@ -65,36 +98,53 @@ namespace SIPSorcery.Net
         /// </summary>
         public event Action<string> OnClosed;
 
-        public UdpReceiver(Socket udpSocket)
+        public UdpReceiver(Socket socket, int mtu = RECEIVE_BUFFER_SIZE)
         {
-            m_udpSocket = udpSocket;
-            m_localEndPoint = m_udpSocket.LocalEndPoint as IPEndPoint;
-            m_recvBuffer = new byte[RECEIVE_BUFFER_SIZE];
-            m_addressFamily = m_udpSocket.LocalEndPoint.AddressFamily;
+            m_socket = socket;
+            m_localEndPoint = m_socket.LocalEndPoint as IPEndPoint;
+            m_recvBuffer = new byte[mtu];
+            m_addressFamily = m_socket.LocalEndPoint.AddressFamily;
         }
 
         /// <summary>
         /// Starts the receive. This method returns immediately. An event will be fired in the corresponding "End" event to
         /// return any data received.
         /// </summary>
-        public void BeginReceiveFrom()
+        public virtual void BeginReceiveFrom()
         {
+            //Prevent call BeginReceiveFrom if it is already running
+            if(m_isClosed && m_isRunningReceive)
+            {
+                m_isRunningReceive = false;
+            }
+            if (m_isRunningReceive || m_isClosed)
+            {
+                return;
+            }
+
             try
             {
+                m_isRunningReceive = true;
                 EndPoint recvEndPoint = m_addressFamily == AddressFamily.InterNetwork ? new IPEndPoint(IPAddress.Any, 0) : new IPEndPoint(IPAddress.IPv6Any, 0);
-                m_udpSocket.BeginReceiveFrom(m_recvBuffer, 0, m_recvBuffer.Length, SocketFlags.None, ref recvEndPoint, EndReceiveFrom, null);
+                m_socket.BeginReceiveFrom(m_recvBuffer, 0, m_recvBuffer.Length, SocketFlags.None, ref recvEndPoint, EndReceiveFrom, null);
             }
-            catch (ObjectDisposedException) { } // Thrown when socket is closed. Can be safely ignored.
+            // Thrown when socket is closed. Can be safely ignored.
             // This exception can be thrown in response to an ICMP packet. The problem is the ICMP packet can be a false positive.
             // For example if the remote RTP socket has not yet been opened the remote host could generate an ICMP packet for the 
             // initial RTP packets. Experience has shown that it's not safe to close an RTP connection based solely on ICMP packets.
+            catch (ObjectDisposedException) 
+            {
+                m_isRunningReceive = false;
+            } 
             catch (SocketException sockExcp)
             {
+                m_isRunningReceive = false;
                 logger.LogWarning($"Socket error {sockExcp.SocketErrorCode} in UdpReceiver.BeginReceiveFrom. {sockExcp.Message}");
                 //Close(sockExcp.Message);
             }
             catch (Exception excp)
             {
+                m_isRunningReceive = false;
                 // From https://github.com/dotnet/corefx/blob/e99ec129cfd594d53f4390bf97d1d736cff6f860/src/System.Net.Sockets/src/System/Net/Sockets/Socket.cs#L3262
                 // the BeginReceiveFrom will only throw if there is an problem with the arguments or the socket has been disposed of. In that
                 // case the socket can be considered to be unusable and there's no point trying another receive.
@@ -107,7 +157,7 @@ namespace SIPSorcery.Net
         /// Handler for end of the begin receive call.
         /// </summary>
         /// <param name="ar">Contains the results of the receive.</param>
-        private void EndReceiveFrom(IAsyncResult ar)
+        protected virtual void EndReceiveFrom(IAsyncResult ar)
         {
             try
             {
@@ -115,7 +165,7 @@ namespace SIPSorcery.Net
                 if (!m_isClosed)
                 {
                     EndPoint remoteEP = m_addressFamily == AddressFamily.InterNetwork ? new IPEndPoint(IPAddress.Any, 0) : new IPEndPoint(IPAddress.IPv6Any, 0);
-                    int bytesRead = m_udpSocket.EndReceiveFrom(ar, ref remoteEP);
+                    int bytesRead = m_socket.EndReceiveFrom(ar, ref remoteEP);
 
                     if (bytesRead > 0)
                     {
@@ -130,7 +180,7 @@ namespace SIPSorcery.Net
                         byte[] packetBuffer = new byte[bytesRead];
                         // TODO: When .NET Framework support is dropped switch to using a slice instead of a copy.
                         Buffer.BlockCopy(m_recvBuffer, 0, packetBuffer, 0, bytesRead);
-                        OnPacketReceived?.Invoke(this, m_localEndPoint.Port, remoteEP as IPEndPoint, packetBuffer);
+                        CallOnPacketReceivedCallback(m_localEndPoint.Port, remoteEP as IPEndPoint, packetBuffer);
                     }
                 }
 
@@ -139,19 +189,19 @@ namespace SIPSorcery.Net
                 // It also avoids the situation where if the application cannot keep up with the network then BeginReceiveFrom
                 // will be called synchronously (if data is available it calls the callback method immediately) which can
                 // create a very nasty stack.
-                if (!m_isClosed && m_udpSocket.Available > 0)
+                if (!m_isClosed && m_socket.Available > 0)
                 {
-                    while (!m_isClosed && m_udpSocket.Available > 0)
+                    while (!m_isClosed && m_socket.Available > 0)
                     {
                         EndPoint remoteEP = m_addressFamily == AddressFamily.InterNetwork ? new IPEndPoint(IPAddress.Any, 0) : new IPEndPoint(IPAddress.IPv6Any, 0);
-                        int bytesReadSync = m_udpSocket.ReceiveFrom(m_recvBuffer, 0, m_recvBuffer.Length, SocketFlags.None, ref remoteEP);
+                        int bytesReadSync = m_socket.ReceiveFrom(m_recvBuffer, 0, m_recvBuffer.Length, SocketFlags.None, ref remoteEP);
 
                         if (bytesReadSync > 0)
                         {
                             byte[] packetBufferSync = new byte[bytesReadSync];
                             // TODO: When .NET Framework support is dropped switch to using a slice instead of a copy.
                             Buffer.BlockCopy(m_recvBuffer, 0, packetBufferSync, 0, bytesReadSync);
-                            OnPacketReceived?.Invoke(this, m_localEndPoint.Port, remoteEP as IPEndPoint, packetBufferSync);
+                            CallOnPacketReceivedCallback(m_localEndPoint.Port, remoteEP as IPEndPoint, packetBufferSync);
                         }
                         else
                         {
@@ -175,7 +225,7 @@ namespace SIPSorcery.Net
                 // in the BeginReceive method (very handy). Follow-up, this doesn't seem to be the case, the socket exception can occur in 
                 // BeginReceive before any packets have been exchanged. This means it's not safe to close if BeginReceive gets an ICMP 
                 // error since the remote party may not have initialised their socket yet.
-                logger.LogWarning(sockExcp,$"SocketException UdpReceiver.EndReceiveFrom ({sockExcp.SocketErrorCode}). {sockExcp.Message}");
+                logger.LogWarning(sockExcp, $"SocketException UdpReceiver.EndReceiveFrom ({sockExcp.SocketErrorCode}). {sockExcp.Message}");
             }
             catch (ObjectDisposedException) // Thrown when socket is closed. Can be safely ignored.
             { }
@@ -186,6 +236,7 @@ namespace SIPSorcery.Net
             }
             finally
             {
+                m_isRunningReceive = false;
                 if (!m_isClosed)
                 {
                     BeginReceiveFrom();
@@ -196,15 +247,20 @@ namespace SIPSorcery.Net
         /// <summary>
         /// Closes the socket and stops any new receives from being initiated.
         /// </summary>
-        public void Close(string reason)
+        public virtual void Close(string reason)
         {
             if (!m_isClosed)
             {
                 m_isClosed = true;
-                m_udpSocket?.Close();
+                m_socket?.Close();
 
                 OnClosed?.Invoke(reason);
             }
+        }
+
+        protected virtual void CallOnPacketReceivedCallback(int localPort, IPEndPoint remoteEndPoint, byte[] packet)
+        {
+            OnPacketReceived?.Invoke(this, localPort, remoteEndPoint, packet);
         }
     }
 
@@ -451,6 +507,12 @@ namespace SIPSorcery.Net
                     if (dstEndPoint.AddressFamily == AddressFamily.InterNetwork && sendSocket.AddressFamily != dstEndPoint.AddressFamily)
                     {
                         dstEndPoint = new IPEndPoint(dstEndPoint.Address.MapToIPv6(), dstEndPoint.Port);
+                    }
+
+                    //Fix ReceiveFrom logic if any previous exception happens
+                    if (!m_rtpReceiver.IsRunningReceive && !m_rtpReceiver.IsClosed)
+                    {
+                        m_rtpReceiver.BeginReceiveFrom();
                     }
 
                     sendSocket.BeginSendTo(buffer, 0, buffer.Length, SocketFlags.None, dstEndPoint, EndSendTo, sendSocket);

@@ -58,6 +58,9 @@ namespace SIPSorcery.Net
 
         private static LookupClient _lookupClient;
 
+        /// <summary>
+        /// Set to true to attempt a DNS lookup over TCP if the UDP lookup fails.
+        /// </summary>
         private static bool _dnsUseTcpFallback;
 
         /// <summary>
@@ -114,8 +117,11 @@ namespace SIPSorcery.Net
             }
             else
             {
-                if (!uri.Host.Contains(".") || uri.Host.EndsWith(MDNS_TLD))
+                bool useDnsClient = true;
+
+                if (!uri.Host.Contains(".") || uri.Host.EndsWith(MDNS_TLD) || queryType == QueryType.A || queryType == QueryType.AAAA)
                 {
+                    useDnsClient = false;
                     AddressFamily family = (queryType == QueryType.AAAA) ? AddressFamily.InterNetworkV6 :
                         AddressFamily.InterNetwork;
 
@@ -141,7 +147,8 @@ namespace SIPSorcery.Net
                         if (addressList?.Length == 0)
                         {
                             logger.LogWarning($"Operating System DNS lookup failed for {uri.Host}.");
-                            return null;
+                            useDnsClient = true;
+                            //return null;
                         }
                         else
                         {
@@ -161,10 +168,12 @@ namespace SIPSorcery.Net
                     }
                     else
                     {
-                        return null;
+                        useDnsClient = true;
+                        //return null;
                     }
                 }
-                else
+
+                if (useDnsClient)
                 {
                     if (uri.ExplicitPort)
                     {
@@ -205,6 +214,7 @@ namespace SIPSorcery.Net
                     }
                 }
             }
+            return null;
         }
 
         /// <summary>
